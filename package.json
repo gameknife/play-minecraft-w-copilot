@@ -1,0 +1,26 @@
+{
+  "name": "mcsvr",
+  "version": "1.0.0",
+  "description": "Utilities for running and monitoring a local Minecraft Bedrock server with Copilot CLI.",
+  "main": "map_data.js",
+  "dependencies": {
+    "mcbe-leveldb": "^1.15.0",
+    "prismarine-nbt": "^2.8.0"
+  },
+  "scripts": {
+    "map-data": "node map_data.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gameknife/play-minecraft-w-copilot.git"
+  },
+  "keywords": [],
+  "private": true,
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/gameknife/play-minecraft-w-copilot/issues"
+  },
+  "homepage": "https://github.com/gameknife/play-minecraft-w-copilot#readme"
+}

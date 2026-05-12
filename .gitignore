@@ -1,2 +1,11 @@
 servers/
 archives/
+node_modules/
+.venv/
+__pycache__/
+tools/bedrock-structure-finder/build/
+tools/minecraft-seed-finder/
+.claude/
+tools/bedrock-structure-finder/
+webapp/node_modules/
+webapp/dist/
