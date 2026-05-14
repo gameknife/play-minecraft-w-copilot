@@ -47,6 +47,7 @@ Suggested pattern for a new session:
 4. Open `http://<host>:60120` for the live status page.
 5. Open `http://<host>:60120/map` for the live world map.
 6. Use the same shell session to send admin commands.
+7. Use the floating **AI 服务器助手** in the web UI when you want natural-language actions turned into Bedrock commands.
 
 ## Commands already used successfully
 
@@ -92,6 +93,25 @@ The dashboard is designed in a Minecraft-site-inspired style and currently shows
 - live player count and player name list from the Bedrock log
 - elapsed in-world days and current in-world time from `level.dat`
 - current server uptime
+- a floating AI assistant panel that can turn natural-language requests into executable Bedrock command plans
+
+## AI assistant workflow
+
+The floating assistant is available on both `/` and `/map`.
+
+Current behavior:
+
+- detects local AI CLIs and prefers `claude`, then `copilot`, then `codex`
+- sends the selected local CLI the current server context, including online players
+- asks the local CLI to return a Bedrock-console-only command plan
+- shows the generated summary, warnings, clarification questions, and exact commands before execution
+- requires a second confirmation click before commands are written into the Bedrock command FIFO
+
+Safety guardrails:
+
+- generated commands are validated as Bedrock console lines, not shell commands
+- command roots such as `stop`, `op`, `deop`, `kick`, `ban`, `whitelist`, and related nested `execute ... run ...` forms are blocked
+- the current implementation is intended for gameplay/admin assistance such as items, XP, effects, teleports, simple builds, and short command sequences
 
 ## Map page contents
 

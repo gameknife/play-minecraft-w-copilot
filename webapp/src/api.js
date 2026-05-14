@@ -16,6 +16,19 @@ export const api = {
   status: () => fetchJson('/api/status'),
   mapData: (refresh = false) => fetchJson(`/api/map-data${refresh ? '?refresh=1' : ''}`),
   livePlayers: () => fetchJson('/api/live-players'),
+  agentInfo: () => fetchJson('/api/agent/info'),
+  agentPlan: (payload) =>
+    fetchJson('/api/agent/plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  agentExecute: (payload) =>
+    fetchJson('/api/agent/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
   teleportPreview: (x, z) => fetchJson(`/api/teleport-preview?x=${encodeURIComponent(x)}&z=${encodeURIComponent(z)}`),
   teleportPlayer: (payload) =>
     fetchJson('/api/teleport-player', {

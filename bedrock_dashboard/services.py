@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
-import gzip
 import html
 import json
 import math
 import re
+import shutil
 import struct
 import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S:%f"
@@ -40,6 +37,106 @@ CONNECTED_RE = re.compile(r"^\[.+? INFO\] Player connected: (?P<value>[^,]+),")
 SPAWNED_RE = re.compile(r"^\[.+? INFO\] Player Spawned: (?P<value>.+?) xuid:")
 DISCONNECTED_RE = re.compile(r"^\[.+? INFO\] Player disconnected: (?P<value>[^,]+),")
 QUERYTARGET_HEADER_RE = re.compile(r"Target data:\s*(\[.*)?$")
+CLAUDE_CLI_PATHS = ("claude",)
+COPILOT_CLI_PATHS = ("copilot",)
+CODEX_CLI_PATHS = ("codex",)
+FORBIDDEN_AGENT_COMMANDS = {
+    "ban",
+    "ban-ip",
+    "banlist",
+    "deop",
+    "kick",
+    "op",
+    "permission",
+    "reload",
+    "restart",
+    "save",
+    "save-all",
+    "save-off",
+    "save-on",
+    "stop",
+    "whitelist",
+}
+AGENT_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["ready", "needs_clarification", "unsupported"]},
+        "summary": {"type": "string"},
+        "reasoning": {"type": "string"},
+        "commands": {"type": "array", "items": {"type": "string"}},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "questions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["status", "summary", "reasoning", "commands", "warnings", "questions"],
+    "additionalProperties": False,
+}
+
+
+@dataclass(frozen=True)
+class AvailableAgentCli:
+    key: str
+    label: str
+    path: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {"key": self.key, "label": self.label, "path": self.path}
+
+
+@dataclass
+class AgentPlan:
+    id: str
+    backend: str
+    requested_by: str
+    status: str
+    summary: str
+    reasoning: str
+    commands: list[str]
+    warnings: list[str]
+    questions: list[str]
+    created_at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "backend": self.backend,
+            "requestedBy": self.requested_by,
+            "status": self.status,
+            "summary": self.summary,
+            "reasoning": self.reasoning,
+            "commands": self.commands,
+            "warnings": self.warnings,
+            "questions": self.questions,
+            "createdAt": self.created_at,
+        }
+
+
+class AgentPlanStore:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._plans: dict[str, AgentPlan] = {}
+
+    def put(self, plan: AgentPlan) -> AgentPlan:
+        with self._lock:
+            self._plans[plan.id] = plan
+        return plan
+
+    def get(self, plan_id: str) -> AgentPlan | None:
+        with self._lock:
+            return self._plans.get(plan_id)
+
+
+def is_agent_cli_healthy(path: str) -> bool:
+    try:
+        process = subprocess.run(
+            [path, "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return process.returncode == 0
 
 
 def read_properties(path: Path) -> dict[str, str]:
@@ -355,6 +452,225 @@ class BedrockConsoleBridge:
 
         lines = [line.strip() for line in chunk.splitlines() if line.strip()]
         return [(line, next_offset) for line in lines]
+
+
+def detect_available_agent_clis() -> list[AvailableAgentCli]:
+    detected: list[AvailableAgentCli] = []
+    for key, label, candidates in (
+        ("claude", "Claude Code", CLAUDE_CLI_PATHS),
+        ("copilot", "GitHub Copilot CLI", COPILOT_CLI_PATHS),
+        ("codex", "OpenAI Codex CLI", CODEX_CLI_PATHS),
+    ):
+        for candidate in candidates:
+            resolved = shutil.which(candidate)
+            if resolved and is_agent_cli_healthy(resolved):
+                detected.append(AvailableAgentCli(key=key, label=label, path=resolved))
+                break
+    return detected
+
+
+def choose_default_agent_cli() -> AvailableAgentCli | None:
+    available = detect_available_agent_clis()
+    if not available:
+        return None
+    preferred_order = {"claude": 0, "copilot": 1, "codex": 2}
+    available.sort(key=lambda cli: preferred_order.get(cli.key, 99))
+    return available[0]
+
+
+def build_agent_prompt(
+    request_text: str,
+    snapshot: ServerSnapshot,
+    live_players: list[dict[str, Any]],
+    map_data: dict[str, Any],
+) -> str:
+    seed = map_data.get("seed")
+    spawn = map_data.get("spawn")
+    context = {
+        "serverName": snapshot.server_name,
+        "levelName": snapshot.level_name,
+        "difficulty": snapshot.difficulty,
+        "gamemode": snapshot.gamemode,
+        "onlinePlayers": [player["name"] for player in live_players],
+        "livePlayers": live_players,
+        "mapSeed": str(seed) if seed is not None else None,
+        "spawn": spawn,
+        "chunkCount": map_data.get("chunkCount"),
+        "predictedStructureCount": map_data.get("predictedStructureCount"),
+    }
+    return "\n".join(
+        [
+            "You generate Minecraft Bedrock Dedicated Server console command plans.",
+            "Return a structured plan that uses only Bedrock console commands, never shell commands.",
+            "Assume the operator wants commands that can be pasted directly into the Bedrock server console.",
+            "Prefer short, reliable command sequences over clever or fragile ones.",
+            "If the request is ambiguous, ask concise clarification questions instead of guessing.",
+            "Do not include leading slash prefixes unless required by Bedrock; plain console commands are preferred.",
+            "Do not propose commands that stop the server, alter admin permissions, ban/kick users, or manage whitelist state.",
+            "When targeting a player, prefer exact quoted name selectors like @a[name=\"Player\"] when needed.",
+            "",
+            "Respond in the required JSON schema only.",
+            "",
+            f"Server context: {json.dumps(context, ensure_ascii=False)}",
+            f"Operator request: {request_text.strip()}",
+        ]
+    )
+
+
+def parse_claude_structured_output(stdout: str) -> dict[str, Any]:
+    content = stdout.strip()
+    if not content:
+        raise ValueError("Claude returned no output")
+    json_start = content.find("{")
+    if json_start < 0:
+        raise ValueError("Claude did not return JSON output")
+    payload = json.loads(content[json_start:])
+    structured = payload.get("structured_output")
+    if not isinstance(structured, dict):
+        raise ValueError("Claude response did not include structured output")
+    return structured
+
+
+def normalize_bedrock_commands(commands: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for raw_command in commands:
+        if not isinstance(raw_command, str):
+            raise ValueError("Generated command list is invalid")
+        command = raw_command.strip()
+        if not command:
+            continue
+        if command.startswith("/"):
+            command = command[1:].lstrip()
+        if any(token in command for token in ("&&", "||", ";", "`", "$(", "\n", "\r")):
+            raise ValueError(f"Unsafe command was generated: {command}")
+        root = command.split(maxsplit=1)[0].lower()
+        if root in FORBIDDEN_AGENT_COMMANDS:
+            raise ValueError(f"Blocked server command was generated: {root}")
+        nested_forbidden = re.search(
+            r"(?:^|\s)run\s+(%s)\b" % "|".join(re.escape(item) for item in sorted(FORBIDDEN_AGENT_COMMANDS)),
+            command,
+            re.IGNORECASE,
+        )
+        if nested_forbidden:
+            raise ValueError(f"Blocked nested server command was generated: {nested_forbidden.group(1).lower()}")
+        normalized.append(command)
+    if len(normalized) > 128:
+        raise ValueError("Generated command plan is too large")
+    return normalized
+
+
+def run_claude_agent(cli_path: str, prompt: str, root_dir: Path) -> dict[str, Any]:
+    process = subprocess.run(
+        [
+            cli_path,
+            "-p",
+            "--model",
+            "glm-5-turbo",
+            "--effort",
+            "low",
+            "--tools",
+            "",
+            "--output-format",
+            "json",
+            "--json-schema",
+            json.dumps(AGENT_PLAN_SCHEMA, separators=(",", ":")),
+            prompt,
+        ],
+        cwd=root_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return parse_claude_structured_output(process.stdout)
+
+
+def run_copilot_agent(cli_path: str, prompt: str, root_dir: Path) -> dict[str, Any]:
+    process = subprocess.run(
+        [
+            cli_path,
+            "-C",
+            str(root_dir),
+            "--allow-all-tools",
+            "--no-custom-instructions",
+            "--available-tools",
+            "",
+            "--output-format",
+            "text",
+            "-s",
+            "-p",
+            (
+                prompt
+                + "\n\nReturn JSON only with keys status, summary, reasoning, commands, warnings, questions."
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    content = process.stdout.strip()
+    json_start = content.find("{")
+    json_end = content.rfind("}")
+    if json_start < 0 or json_end < json_start:
+        raise ValueError("Copilot did not return JSON output")
+    payload = json.loads(content[json_start : json_end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("Copilot output was not a JSON object")
+    return payload
+
+
+def generate_agent_plan(
+    root_dir: Path,
+    request_text: str,
+    snapshot: ServerSnapshot,
+    live_players: list[dict[str, Any]],
+    map_data: dict[str, Any],
+    selected_backend: str | None = None,
+) -> AgentPlan:
+    available = detect_available_agent_clis()
+    if not available:
+        raise RuntimeError("No local AI CLI is available")
+
+    selected: AvailableAgentCli | None = None
+    if selected_backend:
+        selected = next((entry for entry in available if entry.key == selected_backend), None)
+        if selected is None:
+            raise ValueError(f"Requested AI backend is not available: {selected_backend}")
+    else:
+        selected = choose_default_agent_cli()
+    if selected is None:
+        raise RuntimeError("No local AI CLI is available")
+
+    prompt = build_agent_prompt(request_text, snapshot, live_players, map_data)
+    if selected.key == "claude":
+        payload = run_claude_agent(selected.path, prompt, root_dir)
+    elif selected.key == "copilot":
+        payload = run_copilot_agent(selected.path, prompt, root_dir)
+    else:
+        raise RuntimeError(f"The detected AI backend is not yet supported for automation: {selected.label}")
+
+    commands = normalize_bedrock_commands(list(payload.get("commands", [])))
+    status = str(payload.get("status", "unsupported"))
+    if status == "ready" and not commands:
+        status = "unsupported"
+    created_at = datetime.now().astimezone().isoformat()
+    return AgentPlan(
+        id=f"plan-{uuid4()}",
+        backend=selected.key,
+        requested_by=request_text.strip(),
+        status=status,
+        summary=str(payload.get("summary", "")).strip(),
+        reasoning=str(payload.get("reasoning", "")).strip(),
+        commands=commands,
+        warnings=[str(item).strip() for item in payload.get("warnings", []) if str(item).strip()],
+        questions=[str(item).strip() for item in payload.get("questions", []) if str(item).strip()],
+        created_at=created_at,
+    )
+
+
+def execute_agent_plan(bridge: BedrockConsoleBridge, plan: AgentPlan) -> None:
+    if plan.status != "ready" or not plan.commands:
+        raise ValueError("That plan is not ready to run")
+    bridge.send_lines(plan.commands)
 
 
 def format_time_of_day(world_ticks: int | None) -> str | None:
@@ -766,4 +1082,3 @@ def format_duration(total_seconds: int | None) -> str:
     if minutes:
         return f"{minutes}m {seconds}s"
     return f"{seconds}s"
-
