@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,17 +9,14 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.requests import Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from .services import (
-    AgentPlanStore,
     BedrockConsoleBridge,
     MapDataCache,
-    detect_available_agent_clis,
-    execute_agent_plan,
-    generate_agent_plan,
     get_live_players,
     perform_safe_teleport,
+    queue_todo_request,
     resolve_ground_target,
     summarize_status,
 )
@@ -35,7 +31,6 @@ class DashboardRuntime:
     server_dir: Path
     map_cache: MapDataCache
     command_bridge: BedrockConsoleBridge
-    agent_plans: AgentPlanStore
 
     @property
     def frontend_dist_dir(self) -> Path:
@@ -102,14 +97,8 @@ def api_live_players() -> JSONResponse:
     return JSONResponse(payload, headers=NO_STORE_HEADERS)
 
 
-@app.get("/api/agent/info")
-def api_agent_info() -> JSONResponse:
-    payload = {"availableBackends": [cli.as_dict() for cli in detect_available_agent_clis()]}
-    return JSONResponse(payload, headers=NO_STORE_HEADERS)
-
-
-@app.post("/api/agent/plan")
-async def api_agent_plan(request: Request) -> JSONResponse:
+@app.post("/api/agent/request")
+async def api_agent_request(request: Request) -> Response:
     current = require_runtime()
     try:
         body = await request.json()
@@ -119,68 +108,17 @@ async def api_agent_plan(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     user_request = body.get("request")
-    backend = body.get("backend")
     if not isinstance(user_request, str) or not user_request.strip():
         raise HTTPException(status_code=400, detail="Missing request text")
-    if backend is not None and (not isinstance(backend, str) or not backend.strip()):
-        raise HTTPException(status_code=400, detail="Invalid backend")
-
-    snapshot = summarize_status(current.root_dir, current.server_dir)
-    live_players = get_live_players(current.command_bridge, snapshot.players_online)
-    map_data = current.map_cache.get(current.root_dir, current.server_dir)
-    try:
-        plan = generate_agent_plan(
-            current.root_dir,
-            user_request,
-            snapshot,
-            live_players,
-            map_data,
-            selected_backend=backend.strip() if isinstance(backend, str) else None,
-        )
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    except subprocess.CalledProcessError as error:
-        detail = error.stderr.strip() or error.stdout.strip() or str(error)
-        raise HTTPException(status_code=502, detail=f"AI backend failed: {detail}") from error
-
-    current.agent_plans.put(plan)
-    return JSONResponse({"plan": plan.as_dict()}, headers=NO_STORE_HEADERS)
-
-
-@app.post("/api/agent/execute")
-async def api_agent_execute(request: Request) -> JSONResponse:
-    current = require_runtime()
-    try:
-        body = await request.json()
-    except Exception as error:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail="Invalid JSON body") from error
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-
-    plan_id = body.get("planId")
-    confirm = body.get("confirm")
-    if not isinstance(plan_id, str) or not plan_id.strip():
-        raise HTTPException(status_code=400, detail="Missing plan ID")
-    if confirm is not True:
-        raise HTTPException(status_code=400, detail="Execution confirmation is required")
-
-    plan = current.agent_plans.get(plan_id.strip())
-    if plan is None:
-        raise HTTPException(status_code=404, detail="Plan not found")
 
     try:
-        execute_agent_plan(current.command_bridge, plan)
+        queue_todo_request(current.root_dir / "TODO.md", user_request)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
-    return JSONResponse(
-        {"ok": True, "plan": plan.as_dict(), "executedCommandCount": len(plan.commands)},
-        headers=NO_STORE_HEADERS,
-    )
+    return Response(status_code=204, headers=NO_STORE_HEADERS)
 
 
 @app.get("/api/teleport-preview")
@@ -269,7 +207,6 @@ def configure_runtime(root_dir: Path, server_dir: Path) -> None:
         server_dir=server_dir.resolve(),
         map_cache=MapDataCache(),
         command_bridge=BedrockConsoleBridge(server_dir.resolve()),
-        agent_plans=AgentPlanStore(),
     )
     runtime.map_cache.start_refresh(runtime.root_dir, runtime.server_dir)
 

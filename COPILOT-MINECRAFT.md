@@ -101,17 +101,11 @@ The floating assistant is available on both `/` and `/map`.
 
 Current behavior:
 
-- detects local AI CLIs and prefers `claude`, then `copilot`, then `codex`
-- sends the selected local CLI the current server context, including online players
-- asks the local CLI to return a Bedrock-console-only command plan
-- shows the generated summary, warnings, clarification questions, and exact commands before execution
-- requires a second confirmation click before commands are written into the Bedrock command FIFO
-
-Safety guardrails:
-
-- generated commands are validated as Bedrock console lines, not shell commands
-- command roots such as `stop`, `op`, `deop`, `kick`, `ban`, `whitelist`, and related nested `execute ... run ...` forms are blocked
-- the current implementation is intended for gameplay/admin assistance such as items, XP, effects, teleports, simple builds, and short command sequences
+- accepts natural-language player/operator requests from the web UI
+- appends each request into `TODO.md` under `## 下一步任务` as an unfinished task
+- includes an instruction that the eventual execution result should be broadcast through mcsvr
+- does not execute local AI CLIs directly from the web request path
+- returns only success/failure for request acceptance; the later interactive agent loop is responsible for reading `TODO.md`, executing the task, and broadcasting the result
 
 ## Map page contents
 

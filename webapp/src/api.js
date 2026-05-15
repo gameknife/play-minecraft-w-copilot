@@ -16,15 +16,8 @@ export const api = {
   status: () => fetchJson('/api/status'),
   mapData: (refresh = false) => fetchJson(`/api/map-data${refresh ? '?refresh=1' : ''}`),
   livePlayers: () => fetchJson('/api/live-players'),
-  agentInfo: () => fetchJson('/api/agent/info'),
-  agentPlan: (payload) =>
-    fetchJson('/api/agent/plan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }),
-  agentExecute: (payload) =>
-    fetchJson('/api/agent/execute', {
+  agentRequest: (payload) =>
+    fetchJson('/api/agent/request', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),

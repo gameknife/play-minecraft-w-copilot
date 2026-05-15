@@ -492,6 +492,8 @@ export async function renderMapPage(root) {
   async function loadMapData(refresh = false) {
     mapData = await api.mapData(refresh)
     updateLists()
+    const warnings = Array.isArray(mapData.warnings) ? mapData.warnings.filter(Boolean) : []
+    hud.textContent = warnings[0] || `地图已刷新 · ${mapData.chunkCount ?? 0} 个区块`
     if (!state.fitted) fitWorld()
     draw()
   }

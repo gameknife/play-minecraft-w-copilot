@@ -24,6 +24,10 @@ MAP_CACHE_TTL_SECONDS = 600
 PREDICTED_STRUCTURE_VERSION = "26.0"
 SEED_FINDER_REPOSITORY = "https://github.com/unworthyzeus/minecraft-seed-finder.git"
 SEED_FINDER_DIRNAME = "minecraft-seed-finder"
+LEVEL_DAT_READ_ATTEMPTS = 3
+LEVEL_DAT_RETRY_DELAY_SECONDS = 0.05
+MAX_WORLD_COORDINATE = 30_000_000
+MAX_PREDICTION_SPAN_BLOCKS = 262_144
 
 START_RE = re.compile(r"^\[(?P<ts>.+?) INFO\] Starting Server$")
 STARTED_RE = re.compile(r"^\[(?P<ts>.+?) INFO\] Server started\.$")
@@ -232,11 +236,7 @@ class NBTReader:
         raise ValueError(f"Unsupported NBT tag type: {tag_type}")
 
 
-def read_level_dat(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-
-    payload = path.read_bytes()
+def parse_level_dat(payload: bytes) -> dict[str, Any]:
     if len(payload) >= 9 and payload[8] == 10:
         payload = payload[8:]
 
@@ -249,6 +249,23 @@ def read_level_dat(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("Expected level.dat root to be a compound")
     return data
+
+
+def read_level_dat(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+
+    last_error: ValueError | None = None
+    for attempt in range(LEVEL_DAT_READ_ATTEMPTS):
+        try:
+            return parse_level_dat(path.read_bytes())
+        except ValueError as error:
+            last_error = error
+            if attempt + 1 == LEVEL_DAT_READ_ATTEMPTS:
+                break
+            time.sleep(LEVEL_DAT_RETRY_DELAY_SECONDS)
+
+    raise ValueError(f"Unable to parse level.dat: {last_error}")
 
 
 def parse_timestamp(value: str | None) -> datetime | None:
@@ -452,6 +469,38 @@ class BedrockConsoleBridge:
 
         lines = [line.strip() for line in chunk.splitlines() if line.strip()]
         return [(line, next_offset) for line in lines]
+
+
+def queue_todo_request(todo_path: Path, request_text: str) -> str:
+    if not request_text.strip():
+        raise ValueError("Missing request text")
+    if not todo_path.exists():
+        raise RuntimeError("TODO.md was not found")
+
+    lines = todo_path.read_text(encoding="utf-8").splitlines()
+    next_tasks_heading = "## 下一步任务"
+    try:
+        next_section_index = next(index for index, line in enumerate(lines) if line.strip() == next_tasks_heading)
+    except StopIteration as error:
+        raise RuntimeError("TODO.md does not contain a '## 下一步任务' section") from error
+
+    next_heading_index = len(lines)
+    for index in range(next_section_index + 1, len(lines)):
+        if lines[index].startswith("## "):
+            next_heading_index = index
+            break
+
+    insert_index = next_heading_index
+    for index in range(next_section_index + 1, next_heading_index):
+        if lines[index].strip().startswith("- ["):
+            insert_index = index
+            break
+
+    normalized_request = " ".join(request_text.split())
+    task_line = f"- [ ] 玩家请求：{normalized_request}；完成后通过 mcsvr 广播执行结果。"
+    lines.insert(insert_index, task_line)
+    todo_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return task_line
 
 
 def detect_available_agent_clis() -> list[AvailableAgentCli]:
@@ -818,6 +867,14 @@ def build_map_bounds(map_data: dict[str, Any], spawn: dict[str, int] | None) -> 
     return {"minX": min_x, "maxX": max_x, "minZ": min_z, "maxZ": max_z}
 
 
+def sanitize_spawn(spawn: dict[str, int] | None) -> dict[str, int] | None:
+    if spawn is None:
+        return None
+    if any(abs(int(spawn[axis])) > MAX_WORLD_COORDINATE for axis in ("x", "z")):
+        return None
+    return spawn
+
+
 def public_map_data(map_data: dict[str, Any]) -> dict[str, Any]:
     public_chunks = []
     for chunk in map_data.get("chunks", []):
@@ -846,6 +903,7 @@ def public_map_data(map_data: dict[str, Any]) -> dict[str, Any]:
         "villages": map_data.get("villages", []),
         "savedPlayers": map_data.get("savedPlayers", []),
         "onlinePlayers": map_data.get("onlinePlayers", []),
+        "warnings": map_data.get("warnings", []),
         "bounds": map_data.get("bounds"),
         "chunkCount": map_data.get("chunkCount", 0),
         "predictedStructureCount": map_data.get("predictedStructureCount", 0),
@@ -927,6 +985,29 @@ def predict_structures(root_dir: Path, seed: Any, bounds: dict[str, int] | None)
     payload = json.loads(process.stdout)
     structures = payload.get("structures", [])
     return [entry for entry in structures if isinstance(entry, dict)]
+
+
+def safe_predict_structures(
+    root_dir: Path, seed: Any, bounds: dict[str, int] | None, warnings: list[str]
+) -> list[dict[str, Any]]:
+    if bounds is None or not isinstance(seed, int):
+        return []
+
+    span_x = int(bounds["maxX"]) - int(bounds["minX"])
+    span_z = int(bounds["maxZ"]) - int(bounds["minZ"])
+    if span_x < 0 or span_z < 0:
+        warnings.append("Skipped predicted structures because the computed map bounds were invalid.")
+        return []
+    if span_x > MAX_PREDICTION_SPAN_BLOCKS or span_z > MAX_PREDICTION_SPAN_BLOCKS:
+        warnings.append("Skipped predicted structures because the scanned world area was unexpectedly large.")
+        return []
+
+    try:
+        return predict_structures(root_dir, seed, bounds)
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.strip() or error.stdout.strip() or str(error)
+        warnings.append(f"Predicted structures are temporarily unavailable: {detail}")
+        return []
 
 
 def resolve_ground_target(map_data: dict[str, Any], x_value: float, z_value: float) -> dict[str, Any]:
@@ -1027,7 +1108,12 @@ def perform_safe_teleport(
 def load_map_data(root_dir: Path, server_dir: Path) -> dict[str, Any]:
     properties, world_dir, level_path = build_world_paths(server_dir)
     world_db_path = world_dir / "db"
-    level_data = read_level_dat(level_path)
+    warnings: list[str] = []
+    try:
+        level_data = read_level_dat(level_path)
+    except ValueError as error:
+        level_data = {}
+        warnings.append(f"Unable to read world metadata from level.dat: {error}")
     snapshot = summarize_status(root_dir, server_dir)
 
     process = subprocess.run(
@@ -1041,11 +1127,15 @@ def load_map_data(root_dir: Path, server_dir: Path) -> dict[str, Any]:
 
     spawn = None
     if all(isinstance(level_data.get(key), int) for key in ("SpawnX", "SpawnY", "SpawnZ")):
-        spawn = {
-            "x": int(level_data["SpawnX"]),
-            "y": int(level_data["SpawnY"]),
-            "z": int(level_data["SpawnZ"]),
-        }
+        spawn = sanitize_spawn(
+            {
+                "x": int(level_data["SpawnX"]),
+                "y": int(level_data["SpawnY"]),
+                "z": int(level_data["SpawnZ"]),
+            }
+        )
+        if spawn is None:
+            warnings.append("Ignored an invalid spawn position read from level.dat.")
 
     result = {
         "generatedAt": map_data.get("generatedAt", datetime.now().astimezone().isoformat()),
@@ -1058,9 +1148,10 @@ def load_map_data(root_dir: Path, server_dir: Path) -> dict[str, Any]:
         "villages": map_data.get("villages", []),
         "savedPlayers": map_data.get("savedPlayers", []),
         "onlinePlayers": snapshot.players_online,
+        "warnings": warnings,
     }
     result["bounds"] = build_map_bounds(result, spawn)
-    result["predictedStructures"] = predict_structures(root_dir, result["seed"], result["bounds"])
+    result["predictedStructures"] = safe_predict_structures(root_dir, result["seed"], result["bounds"], warnings)
     result["predictedStructureVersion"] = PREDICTED_STRUCTURE_VERSION
     result["chunkCount"] = len(result["chunks"])
     result["predictedStructureCount"] = len(result["predictedStructures"])
